@@ -1,83 +1,182 @@
-// public/script.js
+// --- elements ---
+const statusEl   = document.getElementById('status');
+const actionBtn  = document.getElementById('actionBtn'); // Start -> Next
+const stopBtn    = document.getElementById('stopBtn');
+const localVid   = document.getElementById('localVideo');
+const remoteVid  = document.getElementById('remoteVideo');
 
-const statusEl  = document.getElementById('status');
-const nextBtn   = document.getElementById('nextBtn');
-const localVid  = document.getElementById('localVideo');
-const remoteVid = document.getElementById('remoteVideo');
-
-// If same-origin, keep undefined. If your UI is on another origin, set the full URL.
-// const SIGNAL_URL = "https://your-app.ondigitalocean.app";
-const SIGNAL_URL = undefined;
-
+// --- socket.io: force WebSocket only (DO load balancer safe) ---
+const SIGNAL_URL = undefined; // same-origin; set to "https://<your-app>.ondigitalocean.app" if different origin
 const socket = io(SIGNAL_URL, {
   transports: ["websocket"],
   upgrade: false,
   withCredentials: true,
 });
 
+// --- webrtc config (TURN/STUN pulled from /ice) ---
+let pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 let pc, localStream, peerId, isInitiator;
-let pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; // default
 
+// --- matching state machine ---
+let matchingActive = false;  // true when user wants continuous matching
+let currentlyPaired = false; // true when we have a partner
+
+// --- video autoplay helpers ---
 localVid.muted = true;
 localVid.playsInline = true;
 remoteVid.playsInline = true;
 
+// -----------------------------
+// UI state helpers
+// -----------------------------
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function setStoppedUI() {
+  actionBtn.textContent = 'Start';
+  actionBtn.disabled = false;
+  stopBtn.disabled = true;
+}
+
+function setSearchingUI() {
+  actionBtn.textContent = 'Next';
+  actionBtn.disabled = false;
+  stopBtn.disabled = false;
+}
+
+function setConnectedUI() {
+  actionBtn.textContent = 'Next';
+  actionBtn.disabled = false;
+  stopBtn.disabled = false;
+}
+
+// -----------------------------
+// ICE config from server
+// -----------------------------
 async function loadIce() {
   try {
-    const r = await fetch("/ice", { cache: "no-store" });
+    const r = await fetch('/ice', { cache: 'no-store' });
     if (r.ok) {
       const cfg = await r.json();
       if (cfg && Array.isArray(cfg.iceServers)) {
         pcConfig = cfg;
-        console.log("ICE servers:", pcConfig);
+        console.log('ICE servers:', pcConfig);
       }
     }
   } catch (e) {
-    console.warn("ICE load failed, using default STUN only:", e);
+    console.warn('ICE load failed; using default STUN only:', e);
   }
 }
 
-async function init() {
+// -----------------------------
+// Media init on page load
+// -----------------------------
+async function initMedia() {
   try {
     await loadIce();
-
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     localVid.srcObject = localStream;
-    await localVid.play().catch(() => {});
-    socket.emit('join');
+    await localVid.play().catch(()=>{});
+    setStatus('Ready. Click Start to connect with a stranger.');
+    setStoppedUI(); // Start enabled, Stop disabled
   } catch (err) {
-    statusEl.textContent = '❌ Camera/Mic error: ' + err.message;
+    setStatus('❌ Camera/Mic error: ' + err.message);
+    actionBtn.disabled = true;
+    stopBtn.disabled = true;
   }
 }
 
-nextBtn.addEventListener('click', () => {
-  if (pc) { pc.close(); pc = null; }
-  remoteVid.srcObject = null;
-
-  socket.emit('leave');
-  statusEl.textContent = '⏳ Looking for a new partner…';
+// -----------------------------
+// Matching controls
+// -----------------------------
+function startMatching() {
+  matchingActive = true;
+  // Immediately go searching; "Start" turns into "Next"
+  setSearchingUI();
+  setStatus('⏳ Looking for a partner…');
   socket.emit('join');
-  nextBtn.disabled = true;
+}
+
+function nextStranger() {
+  // Skip current (if any) and requeue
+  teardownPeer();
+  remoteVid.srcObject = null;
+  socket.emit('leave');
+  setStatus('⏳ Finding the next partner…');
+  socket.emit('join');
+  setSearchingUI();
+}
+
+function stopMatching() {
+  matchingActive = false;
+  // Leave queue and tear down any connection
+  teardownPeer();
+  remoteVid.srcObject = null;
+  socket.emit('leave');
+  setStatus('Stopped. Click Start when you’re ready.');
+  setStoppedUI();
+}
+
+function teardownPeer() {
+  currentlyPaired = false;
+  if (pc) {
+    pc.onicecandidate = null;
+    pc.ontrack = null;
+    try { pc.close(); } catch {}
+    pc = null;
+  }
+}
+
+// -----------------------------
+// Button wiring
+// -----------------------------
+actionBtn.addEventListener('click', () => {
+  if (!matchingActive) {
+    // Start -> engage continuous matching
+    startMatching();
+  } else {
+    // Already matching: this button means Next
+    nextStranger();
+  }
 });
 
-socket.on('connect', () => console.log('✅ socket connected', socket.id));
+stopBtn.addEventListener('click', () => {
+  if (matchingActive) stopMatching();
+});
+
+// -----------------------------
+// Socket.io events
+// -----------------------------
+socket.on('connect', () => {
+  console.log('✅ socket connected', socket.id);
+});
+
 socket.on('connect_error', (err) => {
   console.error('socket connect_error', err);
-  statusEl.textContent = '⚠️ Connection issue. Retrying…';
+  setStatus('⚠️ Connection issue. Retrying…');
 });
 
 socket.on('waiting', () => {
-  statusEl.textContent = '⏳ Waiting for a partner…';
-  nextBtn.disabled = true;
+  // We only care if the user is in matching mode
+  if (!matchingActive) return;
+  setStatus('⏳ Waiting for a partner…');
+  setSearchingUI();
 });
 
 socket.on('paired', async ({ peerId: id, initiator }) => {
+  if (!matchingActive) {
+    // If user pressed Stop right before pairing came in, exit early
+    socket.emit('leave');
+    return;
+  }
+
   peerId = id;
   isInitiator = initiator;
-  statusEl.textContent = '✅ Paired! ' + (initiator ? 'Sending offer…' : 'Awaiting offer…');
+  currentlyPaired = true;
 
-  nextBtn.disabled = false;
+  setStatus('✅ Paired! ' + (initiator ? 'Sending offer…' : 'Awaiting offer…'));
+  setConnectedUI();
 
+  // create RTCPeerConnection
   pc = new RTCPeerConnection(pcConfig);
   localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
@@ -86,7 +185,7 @@ socket.on('paired', async ({ peerId: id, initiator }) => {
   };
   pc.ontrack = ({ streams: [stream] }) => {
     remoteVid.srcObject = stream;
-    remoteVid.play?.().catch(() => {});
+    remoteVid.play?.().catch(()=>{});
   };
 
   if (isInitiator) {
@@ -98,8 +197,9 @@ socket.on('paired', async ({ peerId: id, initiator }) => {
 
 socket.on('signal', async ({ peerId: from, signal }) => {
   if (!pc) {
+    // Late signal; build PC if we are still matching
+    if (!matchingActive) return;
     peerId = from;
-    statusEl.textContent = '🔧 Setting up connection…';
 
     pc = new RTCPeerConnection(pcConfig);
     localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
@@ -108,7 +208,7 @@ socket.on('signal', async ({ peerId: from, signal }) => {
     };
     pc.ontrack = ({ streams: [stream] }) => {
       remoteVid.srcObject = stream;
-      remoteVid.play?.().catch(() => {});
+      remoteVid.play?.().catch(()=>{});
     };
   }
 
@@ -129,11 +229,22 @@ socket.on('signal', async ({ peerId: from, signal }) => {
 });
 
 socket.on('partner-disconnected', () => {
-  statusEl.textContent = '⚠️ Stranger left. Click “Next Stranger” to find someone else.';
-  if (pc) pc.close();
-  pc = null;
+  currentlyPaired = false;
+  setStatus('⚠️ Stranger left.');
+  teardownPeer();
   remoteVid.srcObject = null;
-  nextBtn.disabled = false;
+
+  // Auto-queue NEXT if the user is still in matching mode
+  if (matchingActive) {
+    setStatus('⚠️ Stranger left. ⏳ Finding the next partner…');
+    socket.emit('join');
+    setSearchingUI();
+  } else {
+    setStoppedUI();
+  }
 });
 
-init();
+// -----------------------------
+// Boot
+// -----------------------------
+initMedia();

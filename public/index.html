@@ -7,18 +7,20 @@
   <style>
     body { font-family: system-ui, sans-serif; margin: 20px; }
     #status { margin: .5rem 0 1rem; }
-    #controls { margin: 1rem 0; }
-    #nextBtn { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
-    #videos { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+    #controls { display:flex; gap:.75rem; margin: 1rem 0; }
+    button { padding:.6rem 1rem; font-size:1rem; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    #videos { display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-start; }
     video { width: min(480px, 45vw); background:#000; border-radius: 12px; }
   </style>
 </head>
 <body>
   <h1>Random Video Chat</h1>
-  <div id="status">Initializing…</div>
+  <div id="status">Initializing camera & mic…</div>
 
   <div id="controls">
-    <button id="nextBtn" disabled>Next Stranger</button>
+    <button id="actionBtn" disabled>Start</button>
+    <button id="stopBtn" disabled>Stop</button>
   </div>
 
   <div id="videos">
@@ -26,7 +28,6 @@
     <video id="remoteVideo" autoplay playsinline></video>
   </div>
 
-  <!-- Load socket.io client served by your server -->
   <script src="/socket.io/socket.io.js"></script>
   <script src="script.js"></script>
 </body>
