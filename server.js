@@ -14,7 +14,7 @@ const io     = new Server(server);
 
 // 2) CONNECT TO REDIS
 //    Use your REDIS_URL env var or default to localhost
-const redisUrl = process.env.REDIS_URL || 'redis://redis-12699.c11.us-east-1-2.ec2.redns.redis-cloud.com:12699';
+const redisUrl = process.env.REDIS_URL || 'redis://default:B4XXyZybEnFw5fC272I7p5BcH5f2TgVp@redis-12699.c11.us-east-1-2.ec2.redns.redis-cloud.com:12699';
 const pubClient = createClient({ url: redisUrl });
 const subClient = pubClient.duplicate();
 
