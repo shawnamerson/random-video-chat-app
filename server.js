@@ -1,63 +1,103 @@
 // server.js
-const express = require('express');
-const http    = require('http');
-const path    = require('path');
+// CommonJS – Redis Cloud auth/TLS via REDIS_URL in .env
 
-// 1) socket.io + redis adapter imports
-const { Server } = require('socket.io');
-const { createClient } = require('redis');
-const { createAdapter } = require('@socket.io/redis-adapter');
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const path = require("path");
 
-const app    = express();
+const { Server } = require("socket.io");
+const { createClient } = require("redis");
+const { createAdapter } = require("@socket.io/redis-adapter");
+
+const app = express();
 const server = http.createServer(app);
-const io     = new Server(server);
+const io = new Server(server);
 
-// 2) CONNECT TO REDIS
-//    Use your REDIS_URL env var or default to localhost
-const redisUrl = process.env.REDIS_URL || 'redis://default:B4XXyZybEnFw5fC272I7p5BcH5f2TgVp@redis-12699.c11.us-east-1-2.ec2.redns.redis-cloud.com:12699';
-const pubClient = createClient({ url: redisUrl });
+// ---------- 1) Redis connection (auth + TLS) ----------
+const redisUrl = process.env.REDIS_URL;
+if (!redisUrl) {
+  console.error(
+    "❌ Missing REDIS_URL. Set e.g. rediss://default:PASSWORD@HOST:PORT in your .env"
+  );
+  process.exit(1);
+}
+
+const isTLS = redisUrl.startsWith("rediss://");
+const redisOpts = {
+  url: redisUrl,
+  socket: isTLS ? { tls: true, rejectUnauthorized: false } : undefined,
+};
+
+const pubClient = createClient(redisOpts);
 const subClient = pubClient.duplicate();
 
 (async () => {
-  await pubClient.connect();
-  await subClient.connect();
-
-  // 3) HOOK UP THE REDIS ADAPTER
-  io.adapter(createAdapter(pubClient, subClient));
-
-  console.log('🗄️  Redis adapter connected');
+  try {
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log("🗄️  Redis adapter connected");
+  } catch (err) {
+    console.error("❌ Redis connect failed:", err);
+    console.warn("⚠️  Falling back to in-memory adapter.");
+    // Default in-memory broadcast if Redis is unavailable
+  }
 })();
 
+// ---------- 2) Static files ----------
+app.use(express.static(path.join(__dirname, "public")));
 
-// 4) YOUR EXISTING PAIRING LOGIC
+// ---------- 3) Simple pairing state ----------
 let waitingSocket = null;
 const pairs = {};
 
-app.use(express.static(path.join(__dirname, 'public')));
-
-io.on('connection', socket => {
+// ---------- 4) Socket.io events ----------
+io.on("connection", (socket) => {
   console.log(`🔌 ${socket.id} connected`);
 
-  socket.on('join', () => {
-    if (waitingSocket) {
+  socket.on("join", () => {
+    if (waitingSocket && waitingSocket.id !== socket.id) {
       const peer = waitingSocket;
       waitingSocket = null;
 
-      socket.emit('paired', { peerId: peer.id, initiator: true });
-      peer.emit('paired',   { peerId: socket.id, initiator: false });
-
+      // pair
       pairs[socket.id] = peer.id;
-      pairs[peer.id]   = socket.id;
+      pairs[peer.id] = socket.id;
+
+      // initiator flags
+      socket.emit("paired", { peerId: peer.id, initiator: true });
+      peer.emit("paired", { peerId: socket.id, initiator: false });
     } else {
       waitingSocket = socket;
-      socket.emit('waiting');
+      socket.emit("waiting");
     }
   });
 
-  socket.on('leave', () => {
+  socket.on("leave", () => {
     const partnerId = pairs[socket.id];
     if (partnerId) {
-      io.to(partnerId).emit('partner-disconnected', { from: socket.id });
+      io.to(partnerId).emit("partner-disconnected", { from: socket.id });
+      delete pairs[socket.id];
+      delete pairs[partnerId];
+    }
+    if (waitingSocket?.id === socket.id) {
+      waitingSocket = null;
+    }
+    socket.emit("left");
+  });
+
+  // relay WebRTC signaling
+  socket.on("signal", ({ peerId, signal }) => {
+    if (!peerId) return;
+    io.to(peerId).emit("signal", { peerId: socket.id, signal });
+  });
+
+  socket.on("disconnect", () => {
+    console.log(`❌ ${socket.id} disconnected`);
+    // don't emit to a disconnected socket
+    const partnerId = pairs[socket.id];
+    if (partnerId) {
+      io.to(partnerId).emit("partner-disconnected", { from: socket.id });
       delete pairs[socket.id];
       delete pairs[partnerId];
     }
@@ -65,19 +105,10 @@ io.on('connection', socket => {
       waitingSocket = null;
     }
   });
-
-  socket.on('signal', ({ peerId, signal }) => {
-    io.to(peerId).emit('signal', { peerId: socket.id, signal });
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`❌ ${socket.id} disconnected`);
-    socket.emit('leave');
-    if (waitingSocket?.id === socket.id) {
-      waitingSocket = null;
-    }
-  });
 });
 
+// ---------- 5) Start server ----------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server listening on http://localhost:${PORT}`));
+server.listen(PORT, () =>
+  console.log(`🚀 Server listening on http://localhost:${PORT}`)
+);
