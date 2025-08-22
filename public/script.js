@@ -1,17 +1,36 @@
-const socket    = io();
+// public/script.js (full replacement)
+
 const statusEl  = document.getElementById('status');
 const nextBtn   = document.getElementById('nextBtn');
 const localVid  = document.getElementById('localVideo');
 const remoteVid = document.getElementById('remoteVideo');
 
-const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+// IMPORTANT: force pure WebSocket so DO's LB doesn't break polling sessions.
+// If this page is served by the same app, leave SIGNAL_URL undefined (same-origin).
+// If your frontend is on another domain, set it explicitly:
+// const SIGNAL_URL = "https://your-do-app.ondigitalocean.app";
+const SIGNAL_URL = undefined;
 
+const socket = io(SIGNAL_URL, {
+  transports: ["websocket"], // <— key: skip polling entirely
+  upgrade: false,
+  withCredentials: true
+});
+
+// WebRTC config
+const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 let pc, localStream, peerId, isInitiator;
+
+// Small autoplay helpers
+localVid.muted = true;
+localVid.playsInline = true;
+remoteVid.playsInline = true;
 
 async function init() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     localVid.srcObject = localStream;
+    await localVid.play().catch(() => {}); // ignore autoplay errors
     socket.emit('join');
   } catch (err) {
     statusEl.textContent = '❌ Camera/Mic error: ' + err.message;
@@ -33,6 +52,15 @@ nextBtn.addEventListener('click', () => {
 
   // disable until paired again
   nextBtn.disabled = true;
+});
+
+socket.on('connect', () => {
+  console.log('✅ socket connected', socket.id);
+});
+
+socket.on('connect_error', (err) => {
+  console.error('socket connect_error', err);
+  statusEl.textContent = '⚠️ Connection issue. Retrying…';
 });
 
 socket.on('waiting', () => {
@@ -58,6 +86,7 @@ socket.on('paired', async ({ peerId: id, initiator }) => {
 
   pc.ontrack = ({ streams: [stream] }) => {
     remoteVid.srcObject = stream;
+    remoteVid.play?.().catch(() => {});
   };
 
   if (isInitiator) {
@@ -80,6 +109,7 @@ socket.on('signal', async ({ peerId: from, signal }) => {
     };
     pc.ontrack = ({ streams: [stream] }) => {
       remoteVid.srcObject = stream;
+      remoteVid.play?.().catch(() => {});
     };
   }
 
@@ -91,7 +121,11 @@ socket.on('signal', async ({ peerId: from, signal }) => {
       socket.emit('signal', { peerId, signal: { sdp: pc.localDescription } });
     }
   } else if (signal.candidate) {
-    await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+    } catch (e) {
+      console.warn('ICE add error (ignored if race):', e.message);
+    }
   }
 });
 
