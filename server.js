@@ -11,11 +11,7 @@ const { createAdapter } = require("@socket.io/redis-adapter");
 const app = express();
 const server = http.createServer(app);
 
-// ===== Socket.IO (CORS: keep same-origin by default) =====
-// If your frontend is hosted elsewhere, set the allowed origins here:
-// const io = new Server(server, {
-//   cors: { origin: ["https://your-frontend.example"], credentials: true },
-// });
+// ===== Socket.IO (same-origin; add CORS origins if hosting UI elsewhere) =====
 const io = new Server(server);
 
 // ===== Redis adapter (required for multi-instance) =====
@@ -50,27 +46,18 @@ app.use(express.static(path.join(__dirname, "public")));
 // ===== Cluster-safe pairing via Redis LIST =====
 const QUEUE_KEY = "rvchat:queue"; // Redis LIST of waiting socket IDs
 
-// Pop the next valid partner from the shared queue (skips stale IDs)
 async function popValidPartner() {
   while (true) {
     const partnerId = await pubClient.lPop(QUEUE_KEY);
     if (!partnerId) return null;
-    const sockets = await io.in(partnerId).fetchSockets(); // cluster-wide presence check
+    const sockets = await io.in(partnerId).fetchSockets();
     if (sockets.length > 0) return partnerId;
-    // else stale: loop to try the next one
   }
 }
-
-// Remove a socket from the queue if present
 async function removeFromQueue(socketId) {
-  try {
-    await pubClient.lRem(QUEUE_KEY, 0, socketId);
-  } catch {
-    // ignore
-  }
+  try { await pubClient.lRem(QUEUE_KEY, 0, socketId); } catch {}
 }
 
-// Local map for partner lookups (per-instance is fine)
 const pairs = {};
 
 io.on("connection", (socket) => {
@@ -79,18 +66,13 @@ io.on("connection", (socket) => {
   socket.on("join", async () => {
     try {
       const partnerId = await popValidPartner();
-
       if (partnerId && partnerId !== socket.id) {
-        // Record pair locally for this instance's sockets
         pairs[socket.id] = partnerId;
         pairs[partnerId] = socket.id;
-
-        // initiator flags
         socket.emit("paired", { peerId: partnerId, initiator: true });
         io.to(partnerId).emit("paired", { peerId: socket.id, initiator: false });
       } else {
-        // No partner available — enqueue this socket globally
-        await removeFromQueue(socket.id); // idempotent cleanup
+        await removeFromQueue(socket.id);
         await pubClient.lPush(QUEUE_KEY, socket.id);
         socket.emit("waiting");
       }
@@ -115,7 +97,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Relay WebRTC signaling (adapter broadcasts cross-instance)
   socket.on("signal", ({ peerId, signal }) => {
     if (!peerId) return;
     io.to(peerId).emit("signal", { peerId: socket.id, signal });
@@ -131,6 +112,47 @@ io.on("connection", (socket) => {
     }
     await removeFromQueue(socket.id);
   });
+});
+
+// ===== ICE config endpoint (serves STUN + TURN from env) =====
+function buildIceServersFromEnv() {
+  // Always include a public STUN
+  const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+
+  // Static TURN (self-hosted coturn or managed provider with long-term creds)
+  // Required envs if you use static TURN:
+  //   TURN_HOST  (e.g. turn.example.com)
+  //   TURN_PORT  (e.g. 3478 for UDP/TCP, and/or 5349 for TLS)
+  //   TURN_USER
+  //   TURN_PASS
+  //   TURN_TLS=true|false  (if true, will add turns: on 5349)
+  if (process.env.TURN_HOST && process.env.TURN_USER && process.env.TURN_PASS) {
+    const host = process.env.TURN_HOST;
+    const port = process.env.TURN_PORT || "3478";
+    const useTLS = String(process.env.TURN_TLS || "false").toLowerCase() === "true";
+
+    const urls = [];
+    // UDP/TCP on 3478
+    urls.push(`turn:${host}:${port}`);
+    urls.push(`turn:${host}:${port}?transport=tcp`);
+
+    // TLS on 5349 if enabled
+    if (useTLS) {
+      urls.push(`turns:${host}:5349?transport=tcp`);
+    }
+
+    iceServers.push({
+      urls,
+      username: process.env.TURN_USER,
+      credential: process.env.TURN_PASS,
+    });
+  }
+
+  return { iceServers };
+}
+
+app.get("/ice", (_req, res) => {
+  res.json(buildIceServersFromEnv());
 });
 
 // ===== Health & debug =====
