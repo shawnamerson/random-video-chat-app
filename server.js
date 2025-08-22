@@ -1,5 +1,5 @@
 // server.js
-// Monolith: serves /public and runs Socket.IO with Redis adapter
+// Monolith: serves /public and runs Socket.IO with Redis adapter + Redis-backed queue
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
@@ -11,19 +11,12 @@ const { createAdapter } = require("@socket.io/redis-adapter");
 const app = express();
 const server = http.createServer(app);
 
-// ===== Socket.IO (set CORS for your domains) =====
-const FRONTEND_ORIGINS = [
-  // If the page is served by this same service, you can keep this array empty.
-  // Otherwise, list every origin that will load your site:
-  "https://<your-do-app>.ondigitalocean.app",
-  // "https://your-custom-domain.com",
-];
-
-const io = new Server(server, {
-  cors: FRONTEND_ORIGINS.length
-    ? { origin: FRONTEND_ORIGINS, credentials: true }
-    : undefined, // same-origin deployment needs no extra CORS
-});
+// ===== Socket.IO (CORS: keep same-origin by default) =====
+// If your frontend is hosted elsewhere, set the allowed origins here:
+// const io = new Server(server, {
+//   cors: { origin: ["https://your-frontend.example"], credentials: true },
+// });
+const io = new Server(server);
 
 // ===== Redis adapter (required for multi-instance) =====
 const redisUrl = process.env.REDIS_URL;
@@ -54,46 +47,81 @@ const subClient = pubClient.duplicate();
 // ===== Static files =====
 app.use(express.static(path.join(__dirname, "public")));
 
-// ===== Simple pairing (works cross-instance thanks to Redis adapter) =====
-let waitingSocket = null;
+// ===== Cluster-safe pairing via Redis LIST =====
+const QUEUE_KEY = "rvchat:queue"; // Redis LIST of waiting socket IDs
+
+// Pop the next valid partner from the shared queue (skips stale IDs)
+async function popValidPartner() {
+  while (true) {
+    const partnerId = await pubClient.lPop(QUEUE_KEY);
+    if (!partnerId) return null;
+    const sockets = await io.in(partnerId).fetchSockets(); // cluster-wide presence check
+    if (sockets.length > 0) return partnerId;
+    // else stale: loop to try the next one
+  }
+}
+
+// Remove a socket from the queue if present
+async function removeFromQueue(socketId) {
+  try {
+    await pubClient.lRem(QUEUE_KEY, 0, socketId);
+  } catch {
+    // ignore
+  }
+}
+
+// Local map for partner lookups (per-instance is fine)
 const pairs = {};
 
 io.on("connection", (socket) => {
   console.log(`🔌 ${socket.id} connected`);
 
-  socket.on("join", () => {
-    if (waitingSocket && waitingSocket.id !== socket.id) {
-      const peer = waitingSocket;
-      waitingSocket = null;
+  socket.on("join", async () => {
+    try {
+      const partnerId = await popValidPartner();
 
-      pairs[socket.id] = peer.id;
-      pairs[peer.id] = socket.id;
+      if (partnerId && partnerId !== socket.id) {
+        // Record pair locally for this instance's sockets
+        pairs[socket.id] = partnerId;
+        pairs[partnerId] = socket.id;
 
-      socket.emit("paired", { peerId: peer.id, initiator: true });
-      peer.emit("paired", { peerId: socket.id, initiator: false });
-    } else {
-      waitingSocket = socket;
-      socket.emit("waiting");
+        // initiator flags
+        socket.emit("paired", { peerId: partnerId, initiator: true });
+        io.to(partnerId).emit("paired", { peerId: socket.id, initiator: false });
+      } else {
+        // No partner available — enqueue this socket globally
+        await removeFromQueue(socket.id); // idempotent cleanup
+        await pubClient.lPush(QUEUE_KEY, socket.id);
+        socket.emit("waiting");
+      }
+    } catch (err) {
+      console.error("join error:", err);
+      socket.emit("error", { message: "Failed to join queue" });
     }
   });
 
-  socket.on("leave", () => {
-    const partnerId = pairs[socket.id];
-    if (partnerId) {
-      io.to(partnerId).emit("partner-disconnected", { from: socket.id });
-      delete pairs[socket.id];
-      delete pairs[partnerId];
+  socket.on("leave", async () => {
+    try {
+      const partnerId = pairs[socket.id];
+      if (partnerId) {
+        io.to(partnerId).emit("partner-disconnected", { from: socket.id });
+        delete pairs[socket.id];
+        delete pairs[partnerId];
+      }
+      await removeFromQueue(socket.id);
+      socket.emit("left");
+    } catch (err) {
+      console.error("leave error:", err);
     }
-    if (waitingSocket?.id === socket.id) waitingSocket = null;
-    socket.emit("left");
   });
 
+  // Relay WebRTC signaling (adapter broadcasts cross-instance)
   socket.on("signal", ({ peerId, signal }) => {
     if (!peerId) return;
     io.to(peerId).emit("signal", { peerId: socket.id, signal });
   });
 
-  socket.on("disconnect", () => {
+  socket.on("disconnect", async () => {
     console.log(`❌ ${socket.id} disconnected`);
     const partnerId = pairs[socket.id];
     if (partnerId) {
@@ -101,13 +129,20 @@ io.on("connection", (socket) => {
       delete pairs[socket.id];
       delete pairs[partnerId];
     }
-    if (waitingSocket?.id === socket.id) waitingSocket = null;
+    await removeFromQueue(socket.id);
   });
 });
 
-// ===== Health check =====
+// ===== Health & debug =====
 app.get("/healthz", (_req, res) => {
   res.json({ server: "ok", redis: pubClient?.isOpen ? "ok" : "disconnected" });
+});
+
+app.get("/whoami", (_req, res) => {
+  res.json({
+    instance: process.env.HOSTNAME || `pid:${process.pid}`,
+    redis: pubClient?.isOpen ? "ok" : "disconnected",
+  });
 });
 
 // ===== Start =====

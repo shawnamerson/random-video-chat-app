@@ -1,27 +1,32 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <title>Random Video Chat</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    /* …your existing styles… */
-    #controls { margin: 1em; }
-    #nextBtn {
-      padding: 0.5em 1em;
-      font-size: 1rem;
-      cursor: pointer;
-    }
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    #status { margin: .5rem 0 1rem; }
+    #controls { margin: 1rem 0; }
+    #nextBtn { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #videos { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+    video { width: min(480px, 45vw); background:#000; border-radius: 12px; }
   </style>
 </head>
 <body>
   <h1>Random Video Chat</h1>
   <div id="status">Initializing…</div>
+
   <div id="controls">
     <button id="nextBtn" disabled>Next Stranger</button>
   </div>
-  <video id="localVideo" autoplay muted playsinline></video>
-  <video id="remoteVideo" autoplay playsinline></video>
 
+  <div id="videos">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <!-- Load socket.io client served by your server -->
   <script src="/socket.io/socket.io.js"></script>
   <script src="script.js"></script>
 </body>

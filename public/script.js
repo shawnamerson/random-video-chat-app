@@ -1,4 +1,4 @@
-// public/script.js (full replacement)
+// public/script.js
 
 const statusEl  = document.getElementById('status');
 const nextBtn   = document.getElementById('nextBtn');
@@ -14,7 +14,7 @@ const SIGNAL_URL = undefined;
 const socket = io(SIGNAL_URL, {
   transports: ["websocket"], // <— key: skip polling entirely
   upgrade: false,
-  withCredentials: true
+  withCredentials: true,
 });
 
 // WebRTC config
