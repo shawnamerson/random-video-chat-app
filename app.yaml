@@ -1,0 +1,23 @@
+name: random-video-chat-app
+region: nyc
+services:
+  - name: signaling
+    environment_slug: node-js
+    source_dir: /
+    http_port: 3000
+    instance_size_slug: basic-xs
+    instance_count: 2 # run 2 instances; your Redis adapter + queue supports this
+    routes:
+      - path: /
+    health_check:
+      http_path: /healthz
+    build_command: "npm ci"
+    run_command: "npm start"
+    envs:
+      # Set this in the DO UI after creating the app (or put a placeholder here and edit in UI)
+      - key: REDIS_URL
+        type: SECRET
+        scope: RUN_AND_BUILD_TIME
+      - key: NODE_ENV
+        value: production
+        scope: RUN_AND_BUILD_TIME
