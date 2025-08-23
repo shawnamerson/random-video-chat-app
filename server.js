@@ -113,27 +113,38 @@ io.on("connection", (socket) => {
   console.log(`🔌 ${socket.id} connected`);
 
   // Client asks to join the matchmaking queue
-  socket.on("join", async () => {
-    try {
-      // First, see if we can match immediately
-      const partnerId = await popValidWaiting();
+// ADD THIS in server.js inside: io.on("connection", (socket) => { ... });
 
-      if (partnerId && partnerId !== socket.id) {
-        await setPaired(socket.id, partnerId);
-
-        // Initiator is the most recent joiner
-        socket.emit("paired", { peerId: partnerId, initiator: true });
-        io.to(partnerId).emit("paired", { peerId: socket.id, initiator: false });
-      } else {
-        // No one waiting: enqueue this socket
-        await enqueue(socket.id);
-        socket.emit("waiting");
-      }
-    } catch (e) {
-      console.error("join error:", e);
-      socket.emit("error", { message: "Failed to join queue" });
+socket.on("next", async () => {
+  try {
+    // 1) If paired, break the pair and re-queue the partner immediately
+    const partnerId = await getPartner(socket.id);
+    if (partnerId) {
+      await clearPair(socket.id, partnerId);
+      await enqueue(partnerId);
+      io.to(partnerId).emit("waiting");
     }
-  });
+
+    // 2) Try to match right now (pop someone from the queue)
+    const candidate = await popValidWaiting();
+
+    if (candidate && candidate !== socket.id) {
+      await setPaired(socket.id, candidate);
+
+      // The one who clicked "Next" is initiator
+      socket.emit("paired", { peerId: candidate, initiator: true });
+      io.to(candidate).emit("paired", { peerId: socket.id, initiator: false });
+    } else {
+      // 3) If nobody was available, enqueue this socket and wait
+      await enqueue(socket.id);
+      socket.emit("waiting");
+    }
+  } catch (e) {
+    console.error("next error:", e);
+    socket.emit("error", { message: "Failed to go next" });
+  }
+});
+
 
   // Client wants to leave current match and find the next
   socket.on("leave", async () => {
