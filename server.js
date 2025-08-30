@@ -1,6 +1,6 @@
 // server/server.js
-// Socket.IO signaling server with Redis-backed queue + pairs.
-// When one user clicks "Next" (leave), the partner is re-queued automatically.
+// Socket.IO signaling server with Redis-backed queue + pairs (FIFO).
+// Handles join/leave/next/signal, emits waiting/paired/partner-disconnected.
 
 require("dotenv").config();
 const express = require("express");
@@ -15,14 +15,14 @@ const server = http.createServer(app);
 
 // ====== CORS (add your frontend origins) ======
 const ALLOWED_ORIGINS = [
-  "http://localhost:3000",                  // Next.js dev
+  "http://localhost:3000",                    // Next.js dev
   "https://<your-vercel-project>.vercel.app", // Vercel preview/prod
-  // "https://yourdomain.com",               // add when you have a custom domain
+  // "https://yourdomain.com",
 ];
 
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, credentials: true },
-  transports: ["websocket"], // keep WS-only for DO LB
+  transports: ["websocket"], // WS-only works well behind DO load balancers
 });
 
 // ====== Redis adapter (required for multi-instance) ======
@@ -49,7 +49,7 @@ const subClient = pubClient.duplicate();
   }
 })();
 
-// ====== Static (optional if you serve /public here) ======
+// ====== Static (optional) ======
 app.use(express.static(path.join(__dirname, "public")));
 
 // ====== Health ======
@@ -58,16 +58,17 @@ app.get("/healthz", (_req, res) =>
 );
 
 // ====== Redis keys ======
-const QUEUE_KEY = "rvchat:queue"; // LIST of waiting socketIds
+const QUEUE_KEY = "rvchat:queue"; // LIST of waiting socketIds (FIFO)
 const PAIRS_KEY = "rvchat:pairs"; // HASH socketId -> partnerId
 
-// ---- Queue helpers ----
+// ---- Queue helpers (FIFO) ----
+// Use rPush + lPop for FIFO. (lPush + lPop was LIFO.)
 async function enqueue(id) {
   if (!id) return;
   try {
-    // De-dup (best-effort): remove previous occurrences then push
-    await pubClient.lRem(QUEUE_KEY, 0, id);
-    await pubClient.lPush(QUEUE_KEY, id);
+    await pubClient.lRem(QUEUE_KEY, 0, id); // de-dup best effort
+    await pubClient.rPush(QUEUE_KEY, id);   // enqueue to tail
+    io.to(id).emit("waiting");
   } catch {}
 }
 
@@ -77,11 +78,12 @@ async function removeFromQueue(id) {
   } catch {}
 }
 
-async function popValidWaiting() {
-  // Pop until we find a connected socket (stale IDs can exist)
+async function popValidWaiting(excludeId) {
+  // Keep popping until we find a connected socket that's not the caller
   while (true) {
     const id = await pubClient.lPop(QUEUE_KEY);
     if (!id) return null;
+    if (excludeId && id === excludeId) continue;
     const sockets = await io.in(id).fetchSockets();
     if (sockets.length > 0) return id; // valid
     // else loop to skip stale
@@ -98,7 +100,6 @@ async function getPartner(id) {
   return pubClient.hGet(PAIRS_KEY, id);
 }
 async function clearPair(a, b) {
-  // Accept one or both; look up the other if missing
   if (!a && !b) return;
   if (a && !b) b = await getPartner(a);
   if (b && !a) a = await getPartner(b);
@@ -106,88 +107,144 @@ async function clearPair(a, b) {
   if (a) ops.push(pubClient.hDel(PAIRS_KEY, a));
   if (b) ops.push(pubClient.hDel(PAIRS_KEY, b));
   await Promise.all(ops);
+  return { a, b };
+}
+
+function notifyPartnerDisconnected(id) {
+  if (!id) return;
+  io.to(id).emit("partner-disconnected");
+}
+
+// Try to match a specific caller immediately.
+// If no one is available, we enqueue caller and emit "waiting".
+async function tryMatchNow(callerId, initiatorIsCaller = true) {
+  // Make sure caller isn't still in queue (from a previous wait)
+  await removeFromQueue(callerId);
+
+  const candidate = await popValidWaiting(callerId);
+  if (candidate) {
+    await setPaired(callerId, candidate);
+
+    // Newer action becomes initiator for snappier offers
+    io.to(callerId).emit("paired", { peerId: candidate, initiator: initiatorIsCaller });
+    io.to(candidate).emit("paired", { peerId: callerId, initiator: !initiatorIsCaller });
+    return true;
+  }
+
+  // Nobody available yet
+  await enqueue(callerId);
+  return false;
 }
 
 // ====== Socket.IO ======
 io.on("connection", (socket) => {
-  console.log(`🔌 ${socket.id} connected`);
+  const id = socket.id;
+  console.log(`🔌 ${id} connected`);
 
-  // Client asks to join the matchmaking queue
-// ADD THIS in server.js inside: io.on("connection", (socket) => { ... });
-
-socket.on("next", async () => {
-  try {
-    // 1) If paired, break the pair and re-queue the partner immediately
-    const partnerId = await getPartner(socket.id);
-    if (partnerId) {
-      await clearPair(socket.id, partnerId);
-      await enqueue(partnerId);
-      io.to(partnerId).emit("waiting");
-    }
-
-    // 2) Try to match right now (pop someone from the queue)
-    const candidate = await popValidWaiting();
-
-    if (candidate && candidate !== socket.id) {
-      await setPaired(socket.id, candidate);
-
-      // The one who clicked "Next" is initiator
-      socket.emit("paired", { peerId: candidate, initiator: true });
-      io.to(candidate).emit("paired", { peerId: socket.id, initiator: false });
-    } else {
-      // 3) If nobody was available, enqueue this socket and wait
-      await enqueue(socket.id);
-      socket.emit("waiting");
-    }
-  } catch (e) {
-    console.error("next error:", e);
-    socket.emit("error", { message: "Failed to go next" });
-  }
-});
-
-
-  // Client wants to leave current match and find the next
-  socket.on("leave", async () => {
+  // --- JOIN (Start) ---
+  socket.on("join", async () => {
     try {
-      const partnerId = await getPartner(socket.id);
+      // If already paired, ignore join
+      const current = await getPartner(id);
+      if (current) return;
+
+      // Try to match immediately; fallback to enqueue
+      await tryMatchNow(id, /* initiatorIsCaller */ true);
+    } catch (e) {
+      console.error("join error:", e);
+      socket.emit("error", { message: "Failed to join queue" });
+    }
+  });
+
+  // --- NEXT ---
+  // Works whether paired or just waiting:
+  // - If paired: break pair, notify partner, requeue partner, then try to match caller immediately.
+  // - If waiting: move caller to back and try again, so first Next isn't a no-op.
+  socket.on("next", async () => {
+    try {
+      const partnerId = await getPartner(id);
 
       if (partnerId) {
-        // Break the pair
-        await clearPair(socket.id, partnerId);
+        // Break the pair & notify both sides
+        const { a, b } = await clearPair(id, partnerId);
+        if (a && b) {
+          notifyPartnerDisconnected(a);
+          notifyPartnerDisconnected(b);
+        }
 
-        // Re-queue the partner immediately so the *very next join* finds them
-        await enqueue(partnerId);
-        io.to(partnerId).emit("waiting");
+        // Requeue the partner first so they don't get stuck
+        const partnerSocket = await io.in(partnerId).fetchSockets();
+        if (partnerSocket.length) await enqueue(partnerId);
+
+        // Now try to match the caller instantly
+        await tryMatchNow(id, /* initiatorIsCaller */ true);
+      } else {
+        // Not paired yet → shake the queue so Next actually does something
+        await removeFromQueue(id);
+        // Try to match right now; if none available, enqueue to the tail
+        await tryMatchNow(id, /* initiatorIsCaller */ true);
+      }
+    } catch (e) {
+      console.error("next error:", e);
+      socket.emit("error", { message: "Failed to go next" });
+    }
+  });
+
+  // --- LEAVE ---
+  socket.on("leave", async () => {
+    try {
+      const partnerId = await getPartner(id);
+
+      if (partnerId) {
+        const { a, b } = await clearPair(id, partnerId);
+        if (a && b) {
+          // Tell both clients to teardown
+          notifyPartnerDisconnected(a);
+          notifyPartnerDisconnected(b);
+        }
+        // Requeue the partner so they can be matched again
+        const partnerSocket = await io.in(partnerId).fetchSockets();
+        if (partnerSocket.length) await enqueue(partnerId);
       }
 
-      // Make sure this socket is not left in the queue
-      await removeFromQueue(socket.id);
-
-      // Client leaves cleanly (they’ll usually `join` right after for "Next")
+      await removeFromQueue(id); // ensure not left in queue
       socket.emit("left");
     } catch (e) {
       console.error("leave error:", e);
     }
   });
 
-  // WebRTC signaling relay
-  socket.on("signal", ({ peerId, signal }) => {
+  // --- SIGNAL RELAY (SDP/ICE) ---
+  socket.on("signal", async ({ peerId, signal }) => {
     if (!peerId) return;
-    io.to(peerId).emit("signal", { peerId: socket.id, signal });
+
+    // Optional safety: only relay if they are currently paired
+    try {
+      const partner = await getPartner(id);
+      if (partner !== peerId) return; // drop stale/spoofed signals
+    } catch {}
+
+    io.to(peerId).emit("signal", { peerId: id, signal });
   });
 
-  // Cleanup on disconnect
+  // --- DISCONNECT ---
   socket.on("disconnect", async () => {
-    console.log(`❌ ${socket.id} disconnected`);
+    console.log(`❌ ${id} disconnected`);
     try {
-      const partnerId = await getPartner(socket.id);
+      const partnerId = await getPartner(id);
       if (partnerId) {
-        // Break pair and re-queue the partner so they auto-match
-        await clearPair(socket.id, partnerId);
-        await enqueue(partnerId);
-        io.to(partnerId).emit("waiting");
+        const { a, b } = await clearPair(id, partnerId);
+        if (a && b) notifyPartnerDisconnected(b); // tell the remaining partner
+
+        // Requeue surviving partner so they auto-match
+        const partnerSocket = await io.in(partnerId).fetchSockets();
+        if (partnerSocket.length) {
+          await enqueue(partnerId);
+          // Optional: try an immediate match for them
+          await tryMatchNow(partnerId, /* initiatorIsCaller */ false);
+        }
       }
-      await removeFromQueue(socket.id);
+      await removeFromQueue(id);
     } catch (e) {
       console.error("disconnect cleanup error:", e);
     }
@@ -195,7 +252,6 @@ socket.on("next", async () => {
 });
 
 // ====== Start ======
-// Tip: in local dev, you may prefer PORT=3001 so it doesn't clash with Next dev on 3000
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server listening on http://0.0.0.0:${PORT}`);
