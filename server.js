@@ -129,6 +129,14 @@ async function unbanIP(ip) {
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json()); // Parse JSON bodies for admin endpoints
 
+// CORS for admin endpoints
+const cors = require("cors");
+app.use("/admin", cors({
+  origin: "*", // Allow all origins for admin endpoints (protected by ADMIN_KEY)
+  methods: ["GET", "POST"],
+  credentials: false
+}));
+
 // ====== Admin Middleware ======
 function verifyAdmin(req, res, next) {
   const key = req.headers['x-admin-key'] || req.query.adminKey;
