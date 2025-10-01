@@ -568,6 +568,31 @@ io.on("connection", (socket) => {
       if (!peerSockets.length) return;
 
       const peerIP = peerSockets[0].ip;
+
+      // Check for report abuse - same reporter reporting same target multiple times
+      const abuseKey = `rvchat:report_abuse:${socket.ip}:${peerIP}`;
+      const hasReportedBefore = await pubClient.exists(abuseKey);
+
+      if (hasReportedBefore) {
+        console.log(`⚠️  Report abuse detected: ${socket.ip} already reported ${peerIP}`);
+        socket.emit("error", { message: "You have already reported this user" });
+
+        // Track abuse attempts
+        const abuseCountKey = `rvchat:abuse_count:${socket.ip}`;
+        const abuseCount = await pubClient.incr(abuseCountKey);
+        await pubClient.expire(abuseCountKey, 3600); // 1 hour
+
+        // Ban the abuser if they try to spam reports
+        if (abuseCount >= 3) {
+          console.log(`🚫 Banning report abuser: ${socket.ip} (${abuseCount} abuse attempts)`);
+          await banIP(socket.ip, `report abuse: ${abuseCount} attempts to spam reports`);
+        }
+        return;
+      }
+
+      // Mark that this reporter has reported this peer
+      await pubClient.set(abuseKey, "1", { EX: 3600 }); // 1 hour expiry
+
       const reportKey = `rvchat:reports:${peerIP}`;
 
       // Store report in Redis
@@ -585,12 +610,12 @@ io.on("connection", (socket) => {
 
       console.log(`📢 Report: ${id} (${socket.ip}) reported ${peerId} (${peerIP}) for: ${reason}`);
 
-      // Check report threshold - auto-ban after 10 reports in 1 hour
+      // Check report threshold - auto-ban after 10 UNIQUE reports in 1 hour
       const reportCount = await pubClient.lLen(reportKey);
       const AUTO_BAN_THRESHOLD = 10;
 
       if (reportCount >= AUTO_BAN_THRESHOLD) {
-        console.log(`⚠️  Auto-ban triggered for IP ${peerIP} (${reportCount} reports in 1 hour)`);
+        console.log(`⚠️  Auto-ban triggered for IP ${peerIP} (${reportCount} unique reports in 1 hour)`);
         await banIP(peerIP, `auto-ban: ${reportCount} reports in 1 hour`);
       }
 
