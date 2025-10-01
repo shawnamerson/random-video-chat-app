@@ -581,17 +581,17 @@ io.on("connection", (socket) => {
       });
 
       await pubClient.rPush(reportKey, reportData);
-      await pubClient.expire(reportKey, 86400); // 24 hour window
+      await pubClient.expire(reportKey, 3600); // 1 hour window (3600 seconds)
 
       console.log(`📢 Report: ${id} (${socket.ip}) reported ${peerId} (${peerIP}) for: ${reason}`);
 
-      // Check report threshold
+      // Check report threshold - auto-ban after 10 reports in 1 hour
       const reportCount = await pubClient.lLen(reportKey);
-      const AUTO_BAN_THRESHOLD = 5;
+      const AUTO_BAN_THRESHOLD = 10;
 
       if (reportCount >= AUTO_BAN_THRESHOLD) {
-        console.log(`⚠️  Auto-ban triggered for IP ${peerIP} (${reportCount} reports)`);
-        await banIP(peerIP, `auto-ban: ${reportCount} reports in 24h`);
+        console.log(`⚠️  Auto-ban triggered for IP ${peerIP} (${reportCount} reports in 1 hour)`);
+        await banIP(peerIP, `auto-ban: ${reportCount} reports in 1 hour`);
       }
 
       socket.emit("report-submitted", { success: true });
