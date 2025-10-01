@@ -14,11 +14,12 @@ const app = express();
 const server = http.createServer(app);
 
 // ====== CORS (add your frontend origins) ======
-const ALLOWED_ORIGINS = [
-  "http://localhost:3000",                    // Next.js dev
-  "https://<your-vercel-project>.vercel.app", // Vercel preview/prod
-  // "https://yourdomain.com",
-];
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+  : [
+      "http://localhost:3000", // Next.js dev
+      // Add your production origins here
+    ];
 
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, credentials: true },
@@ -38,23 +39,51 @@ const pubClient = createClient({
 });
 const subClient = pubClient.duplicate();
 
+let redisConnected = false;
+
 (async () => {
   try {
     await Promise.all([pubClient.connect(), subClient.connect()]);
     io.adapter(createAdapter(pubClient, subClient));
+    redisConnected = true;
     console.log("🗄️  Redis adapter connected");
   } catch (err) {
     console.error("❌ Redis connect failed:", err);
-    console.warn("⚠️  Falling back to in-memory adapter (NO cross-instance matchmaking).");
+
+    // In production with multiple instances, Redis is REQUIRED
+    if (process.env.NODE_ENV === "production") {
+      console.error("❌ Cannot run in production without Redis. Exiting...");
+      process.exit(1);
+    }
+
+    console.warn("⚠️  Falling back to in-memory adapter (development only).");
   }
 })();
+
+// Health check for Redis
+pubClient.on("error", (err) => {
+  console.error("❌ Redis client error:", err);
+  redisConnected = false;
+});
+
+pubClient.on("reconnecting", () => {
+  console.log("🔄 Redis reconnecting...");
+});
+
+pubClient.on("ready", () => {
+  console.log("✅ Redis ready");
+  redisConnected = true;
+});
 
 // ====== Static (optional) ======
 app.use(express.static(path.join(__dirname, "public")));
 
 // ====== Health ======
 app.get("/healthz", (_req, res) =>
-  res.json({ server: "ok", redis: pubClient?.isOpen ? "ok" : "disconnected" })
+  res.json({
+    server: "ok",
+    redis: redisConnected && pubClient?.isOpen ? "ok" : "disconnected"
+  })
 );
 
 // ====== Redis keys ======
@@ -69,18 +98,26 @@ async function enqueue(id) {
     await pubClient.lRem(QUEUE_KEY, 0, id); // de-dup best effort
     await pubClient.rPush(QUEUE_KEY, id);   // enqueue to tail
     io.to(id).emit("waiting");
-  } catch {}
+  } catch (err) {
+    console.error(`❌ enqueue error for ${id}:`, err.message);
+  }
 }
 
 async function removeFromQueue(id) {
   try {
     await pubClient.lRem(QUEUE_KEY, 0, id);
-  } catch {}
+  } catch (err) {
+    console.error(`❌ removeFromQueue error for ${id}:`, err.message);
+  }
 }
 
 async function popValidWaiting(excludeId) {
   // Keep popping until we find a connected socket that's not the caller
-  while (true) {
+  const MAX_ATTEMPTS = 50; // Prevent infinite loops if queue gets corrupted
+  let attempts = 0;
+
+  while (attempts < MAX_ATTEMPTS) {
+    attempts++;
     const id = await pubClient.lPop(QUEUE_KEY);
     if (!id) return null;
     if (excludeId && id === excludeId) continue;
@@ -88,6 +125,9 @@ async function popValidWaiting(excludeId) {
     if (sockets.length > 0) return id; // valid
     // else loop to skip stale
   }
+
+  console.warn(`⚠️  popValidWaiting hit max attempts (${MAX_ATTEMPTS}), queue may be corrupted`);
+  return null;
 }
 
 // ---- Pair helpers ----
@@ -137,6 +177,10 @@ async function tryMatchNow(callerId, initiatorIsCaller = true) {
 }
 
 // ====== Socket.IO ======
+// Rate limiting: Track last "next" timestamp per socket
+const nextRateLimits = new Map();
+const NEXT_COOLDOWN_MS = 1000; // 1 second between next clicks
+
 io.on("connection", (socket) => {
   const id = socket.id;
   console.log(`🔌 ${id} connected`);
@@ -162,6 +206,15 @@ io.on("connection", (socket) => {
   // - If waiting: move caller to back and try again, so first Next isn't a no-op.
   socket.on("next", async () => {
     try {
+      // Rate limiting check
+      const now = Date.now();
+      const lastNext = nextRateLimits.get(id) || 0;
+      if (now - lastNext < NEXT_COOLDOWN_MS) {
+        socket.emit("error", { message: "Please wait before clicking next again" });
+        return;
+      }
+      nextRateLimits.set(id, now);
+
       const partnerId = await getPartner(id);
 
       if (partnerId) {
@@ -215,14 +268,40 @@ io.on("connection", (socket) => {
   });
 
   // --- SIGNAL RELAY (SDP/ICE) ---
-  socket.on("signal", async ({ peerId, signal }) => {
-    if (!peerId) return;
+  socket.on("signal", async (data) => {
+    // Input validation
+    if (!data || typeof data !== "object") {
+      console.warn(`⚠️  Invalid signal data from ${id}`);
+      return;
+    }
 
-    // Optional safety: only relay if they are currently paired
+    const { peerId, signal } = data;
+
+    if (!peerId || typeof peerId !== "string") {
+      console.warn(`⚠️  Invalid peerId from ${id}`);
+      return;
+    }
+
+    if (!signal || typeof signal !== "object") {
+      console.warn(`⚠️  Invalid signal object from ${id}`);
+      return;
+    }
+
+    // Optional: size limit to prevent abuse (WebRTC signals are typically small)
+    const signalStr = JSON.stringify(signal);
+    if (signalStr.length > 50000) { // 50KB limit
+      console.warn(`⚠️  Signal too large from ${id}: ${signalStr.length} bytes`);
+      return;
+    }
+
+    // Safety: only relay if they are currently paired
     try {
       const partner = await getPartner(id);
       if (partner !== peerId) return; // drop stale/spoofed signals
-    } catch {}
+    } catch (err) {
+      console.error(`❌ signal validation error for ${id}:`, err.message);
+      return;
+    }
 
     io.to(peerId).emit("signal", { peerId: id, signal });
   });
@@ -245,6 +324,9 @@ io.on("connection", (socket) => {
         }
       }
       await removeFromQueue(id);
+
+      // Cleanup rate limit tracking
+      nextRateLimits.delete(id);
     } catch (e) {
       console.error("disconnect cleanup error:", e);
     }
@@ -265,3 +347,34 @@ io.engine.on("connection_error", (err) => {
     context: err.context,
   });
 });
+
+// ====== Graceful Shutdown ======
+async function gracefulShutdown(signal) {
+  console.log(`\n⚠️  ${signal} received, starting graceful shutdown...`);
+
+  // Stop accepting new connections
+  server.close(() => {
+    console.log("✅ HTTP server closed");
+  });
+
+  // Close all socket connections
+  io.close(() => {
+    console.log("✅ Socket.IO server closed");
+  });
+
+  // Close Redis connections
+  try {
+    await Promise.all([
+      pubClient.quit(),
+      subClient.quit()
+    ]);
+    console.log("✅ Redis connections closed");
+  } catch (err) {
+    console.error("❌ Error closing Redis:", err);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
