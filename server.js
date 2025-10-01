@@ -76,8 +76,74 @@ pubClient.on("ready", () => {
   redisConnected = true;
 });
 
-// ====== Static (optional) ======
+// ====== Ban List Management ======
+const bannedIPs = new Set();
+
+// Load banned IPs from Redis on startup
+async function loadBannedIPs() {
+  try {
+    const ips = await pubClient.sMembers("rvchat:banned_ips");
+    ips.forEach(ip => bannedIPs.add(ip));
+    console.log(`📋 Loaded ${ips.length} banned IPs`);
+  } catch (err) {
+    console.error("❌ Failed to load banned IPs:", err);
+  }
+}
+
+async function banIP(ip, reason = "policy violation") {
+  if (!ip) return;
+  bannedIPs.add(ip);
+  await pubClient.sAdd("rvchat:banned_ips", ip);
+  await pubClient.hSet(`rvchat:ban_details:${ip}`, {
+    reason,
+    timestamp: Date.now().toString(),
+  });
+  console.log(`🚫 Banned IP: ${ip} (${reason})`);
+
+  // Disconnect all sockets from this IP
+  const sockets = await io.fetchSockets();
+  sockets.forEach(socket => {
+    if (socket.ip === ip) {
+      socket.emit("banned", { reason });
+      socket.disconnect(true);
+    }
+  });
+}
+
+async function unbanIP(ip) {
+  if (!ip) return;
+  bannedIPs.delete(ip);
+  await pubClient.sRem("rvchat:banned_ips", ip);
+  await pubClient.del(`rvchat:ban_details:${ip}`);
+  console.log(`✅ Unbanned IP: ${ip}`);
+}
+
+// Load bans after Redis connection
+(async () => {
+  if (redisConnected) {
+    await loadBannedIPs();
+  }
+})();
+
+// ====== Express Middleware ======
 app.use(express.static(path.join(__dirname, "public")));
+app.use(express.json()); // Parse JSON bodies for admin endpoints
+
+// ====== Admin Middleware ======
+function verifyAdmin(req, res, next) {
+  const key = req.headers['x-admin-key'] || req.query.adminKey;
+
+  if (!process.env.ADMIN_KEY) {
+    return res.status(503).json({ error: "Admin API not configured" });
+  }
+
+  if (key !== process.env.ADMIN_KEY) {
+    console.warn(`⚠️  Unauthorized admin access attempt from ${req.ip}`);
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+
+  next();
+}
 
 // ====== Health ======
 app.get("/healthz", (_req, res) =>
@@ -113,6 +179,126 @@ app.get("/ice", (_req, res) => {
   }
 
   res.json({ iceServers });
+});
+
+// ====== Admin Endpoints ======
+
+// Get all reports
+app.get("/admin/reports", verifyAdmin, async (req, res) => {
+  try {
+    const keys = await pubClient.keys("rvchat:reports:*");
+    const reports = {};
+
+    for (const key of keys) {
+      const ip = key.replace("rvchat:reports:", "");
+      const reportList = await pubClient.lRange(key, 0, -1);
+      reports[ip] = reportList.map(r => JSON.parse(r));
+    }
+
+    res.json({ reports, totalIPs: Object.keys(reports).length });
+  } catch (err) {
+    console.error("❌ Error fetching reports:", err);
+    res.status(500).json({ error: "Failed to fetch reports" });
+  }
+});
+
+// Get all banned IPs
+app.get("/admin/bans", verifyAdmin, async (req, res) => {
+  try {
+    const ips = await pubClient.sMembers("rvchat:banned_ips");
+    const bans = [];
+
+    for (const ip of ips) {
+      const details = await pubClient.hGetAll(`rvchat:ban_details:${ip}`);
+      bans.push({
+        ip,
+        reason: details.reason || "unknown",
+        timestamp: details.timestamp ? parseInt(details.timestamp) : null,
+        date: details.timestamp ? new Date(parseInt(details.timestamp)).toISOString() : null
+      });
+    }
+
+    res.json({ bans, total: bans.length });
+  } catch (err) {
+    console.error("❌ Error fetching bans:", err);
+    res.status(500).json({ error: "Failed to fetch bans" });
+  }
+});
+
+// Ban an IP
+app.post("/admin/ban", verifyAdmin, async (req, res) => {
+  try {
+    const { ip, reason } = req.body;
+
+    if (!ip || typeof ip !== "string") {
+      return res.status(400).json({ error: "Invalid IP address" });
+    }
+
+    await banIP(ip, reason || "manual ban");
+    res.json({ success: true, ip, reason: reason || "manual ban" });
+  } catch (err) {
+    console.error("❌ Error banning IP:", err);
+    res.status(500).json({ error: "Failed to ban IP" });
+  }
+});
+
+// Unban an IP
+app.post("/admin/unban", verifyAdmin, async (req, res) => {
+  try {
+    const { ip } = req.body;
+
+    if (!ip || typeof ip !== "string") {
+      return res.status(400).json({ error: "Invalid IP address" });
+    }
+
+    await unbanIP(ip);
+    res.json({ success: true, ip });
+  } catch (err) {
+    console.error("❌ Error unbanning IP:", err);
+    res.status(500).json({ error: "Failed to unban IP" });
+  }
+});
+
+// Get server stats
+app.get("/admin/stats", verifyAdmin, async (req, res) => {
+  try {
+    const sockets = await io.fetchSockets();
+    const queueLength = await pubClient.lLen(QUEUE_KEY);
+    const pairCount = await pubClient.hLen(PAIRS_KEY);
+    const bannedCount = await pubClient.sCard("rvchat:banned_ips");
+    const reportKeys = await pubClient.keys("rvchat:reports:*");
+
+    res.json({
+      connectedUsers: sockets.length,
+      waitingInQueue: queueLength,
+      activePairs: Math.floor(pairCount / 2),
+      bannedIPs: bannedCount,
+      reportedIPs: reportKeys.length,
+      redisConnected: redisConnected && pubClient?.isOpen
+    });
+  } catch (err) {
+    console.error("❌ Error fetching stats:", err);
+    res.status(500).json({ error: "Failed to fetch stats" });
+  }
+});
+
+// Clear reports for an IP
+app.post("/admin/clear-reports", verifyAdmin, async (req, res) => {
+  try {
+    const { ip } = req.body;
+
+    if (!ip || typeof ip !== "string") {
+      return res.status(400).json({ error: "Invalid IP address" });
+    }
+
+    const reportKey = `rvchat:reports:${ip}`;
+    await pubClient.del(reportKey);
+
+    res.json({ success: true, ip });
+  } catch (err) {
+    console.error("❌ Error clearing reports:", err);
+    res.status(500).json({ error: "Failed to clear reports" });
+  }
 });
 
 // ====== Redis keys ======
@@ -206,13 +392,26 @@ async function tryMatchNow(callerId, initiatorIsCaller = true) {
 }
 
 // ====== Socket.IO ======
+// Connection middleware: Check for banned IPs
+io.use((socket, next) => {
+  const ip = socket.handshake.address || socket.handshake.headers['x-forwarded-for'] || socket.conn.remoteAddress;
+
+  if (bannedIPs.has(ip)) {
+    console.log(`🚫 Blocked banned IP: ${ip}`);
+    return next(new Error("banned"));
+  }
+
+  socket.ip = ip; // Store IP on socket for later use
+  next();
+});
+
 // Rate limiting: Track last "next" timestamp per socket
 const nextRateLimits = new Map();
 const NEXT_COOLDOWN_MS = 1000; // 1 second between next clicks
 
 io.on("connection", (socket) => {
   const id = socket.id;
-  console.log(`🔌 ${id} connected`);
+  console.log(`🔌 ${id} connected (IP: ${socket.ip})`);
 
   // --- JOIN (Start) ---
   socket.on("join", async () => {
@@ -333,6 +532,65 @@ io.on("connection", (socket) => {
     }
 
     io.to(peerId).emit("signal", { peerId: id, signal });
+  });
+
+  // --- REPORT ---
+  socket.on("report", async ({ peerId, reason }) => {
+    try {
+      // Validation
+      if (!peerId || typeof peerId !== "string") {
+        socket.emit("error", { message: "Invalid report" });
+        return;
+      }
+
+      if (!reason || typeof reason !== "string" || reason.length > 500) {
+        socket.emit("error", { message: "Invalid report reason" });
+        return;
+      }
+
+      // Can only report current partner
+      const partner = await getPartner(id);
+      if (partner !== peerId) {
+        socket.emit("error", { message: "Can only report current partner" });
+        return;
+      }
+
+      // Get reported user's IP
+      const peerSockets = await io.in(peerId).fetchSockets();
+      if (!peerSockets.length) return;
+
+      const peerIP = peerSockets[0].ip;
+      const reportKey = `rvchat:reports:${peerIP}`;
+
+      // Store report in Redis
+      const reportData = JSON.stringify({
+        reportedSocketId: peerId,
+        reportedIP: peerIP,
+        reportedBy: id,
+        reporterIP: socket.ip,
+        reason,
+        timestamp: Date.now(),
+      });
+
+      await pubClient.rPush(reportKey, reportData);
+      await pubClient.expire(reportKey, 86400); // 24 hour window
+
+      console.log(`📢 Report: ${id} (${socket.ip}) reported ${peerId} (${peerIP}) for: ${reason}`);
+
+      // Check report threshold
+      const reportCount = await pubClient.lLen(reportKey);
+      const AUTO_BAN_THRESHOLD = 5;
+
+      if (reportCount >= AUTO_BAN_THRESHOLD) {
+        console.log(`⚠️  Auto-ban triggered for IP ${peerIP} (${reportCount} reports)`);
+        await banIP(peerIP, `auto-ban: ${reportCount} reports in 24h`);
+      }
+
+      socket.emit("report-submitted", { success: true });
+    } catch (e) {
+      console.error("report error:", e);
+      socket.emit("error", { message: "Failed to submit report" });
+    }
   });
 
   // --- DISCONNECT ---

@@ -16,7 +16,13 @@ services:
     envs:
       - key: REDIS_URL
         type: SECRET
-        scope: RUN_AND_BUILD_TIME # you’ll enter this once in DO UI
+        scope: RUN_AND_BUILD_TIME # you'll enter this once in DO UI
       - key: NODE_ENV
         value: production
+        scope: RUN_AND_BUILD_TIME
+      - key: ADMIN_KEY
+        type: SECRET
+        scope: RUN_AND_BUILD_TIME # Strong random key for admin API access
+      - key: ALLOWED_ORIGINS
+        value: "http://localhost:3000,https://random-video-chat-rose.vercel.app"
         scope: RUN_AND_BUILD_TIME
