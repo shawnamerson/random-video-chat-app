@@ -18,7 +18,8 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
   : [
       "http://localhost:3000", // Next.js dev
-      // Add your production origins here
+      "https://random-video-chat-rose.vercel.app", // Vercel production
+      // Add more Vercel preview deployments if needed
     ];
 
 const io = new Server(server, {
@@ -85,6 +86,34 @@ app.get("/healthz", (_req, res) =>
     redis: redisConnected && pubClient?.isOpen ? "ok" : "disconnected"
   })
 );
+
+// ====== ICE Configuration ======
+// Returns STUN/TURN server configuration for WebRTC
+// You can configure TURN servers via environment variables for better NAT traversal
+app.get("/ice", (_req, res) => {
+  const iceServers = [];
+
+  // Google STUN servers (free, always available)
+  iceServers.push({ urls: "stun:stun.l.google.com:19302" });
+  iceServers.push({ urls: "stun:stun1.l.google.com:19302" });
+
+  // Optional TURN server configuration (recommended for production)
+  // Set these environment variables if you have a TURN server:
+  // TURN_URL, TURN_USERNAME, TURN_CREDENTIAL
+  const turnUrl = process.env.TURN_URL;
+  const turnUsername = process.env.TURN_USERNAME;
+  const turnCredential = process.env.TURN_CREDENTIAL;
+
+  if (turnUrl && turnUsername && turnCredential) {
+    iceServers.push({
+      urls: turnUrl,
+      username: turnUsername,
+      credential: turnCredential
+    });
+  }
+
+  res.json({ iceServers });
+});
 
 // ====== Redis keys ======
 const QUEUE_KEY = "rvchat:queue"; // LIST of waiting socketIds (FIFO)
